@@ -25,6 +25,12 @@
   位置(未登记为 null)。同一时刻的事件先交接后冲正,同类事件按明细编号
   (`item_id`)升序应用。连续同向越界读数除满足间隔条件外,还要求两读数之间
   (前一读数时刻, 本读数时刻] 没有位置变更事件(即同位置)才归为同一区间。
+  测温配置、样品当前位置、全部读数与交接/冲正事件在**同一 SQLite 只读
+  快照**(单个 deferred 读事务)中读取:连接处于 autocommit 时每条 SELECT
+  各自成一事务,并发写入新读数或位置交接可能落在两次 SELECT 之间,使响应
+  拼接不同数据库版本(错误合并区间或归错保管位置);事务内 WAL 快照自首次
+  读取起固定,既不阻塞并发写入,也保证四路数据取自同一版本,异常时
+  ROLLBACK 结束事务。
 """
 from __future__ import annotations
 
@@ -468,44 +474,59 @@ def _location_interval_from(current: dict) -> s.LocationExcursionInterval:
 def get_location_excursions(
     conn: sqlite3.Connection, sample_id: str
 ) -> s.LocationExcursionResponse:
-    """实时重算带保管位置的越界区间;样品或配置缺失由调用方/异常处理为 404。"""
-    profile = _get_profile(conn, sample_id)
-    if profile is None:
-        raise TemperatureError([_conflict(
-            "temp_profile_not_found",
-            f"样品 {sample_id} 尚未登记测温配置(允许温度上下限与最大采样间隔),"
-            "无法计算带保管位置的越界区间",
-            sample_id=sample_id,
-        )])
+    """实时重算带保管位置的越界区间;样品或配置缺失由调用方/异常处理为 404。
 
-    sample = conn.execute(
-        "SELECT location FROM samples WHERE sample_id = ?", (sample_id,)
-    ).fetchone()
-    if sample is None:
-        raise TemperatureError([_conflict(
-            "sample_not_found",
-            f"样品 {sample_id} 不存在",
-            sample_id=sample_id,
-        )])
+    测温配置、样品当前位置、全部读数与交接/冲正事件必须在**同一 SQLite
+    只读快照**中读取:连接为 autocommit 时每条 SELECT 各自提交,并发的新
+    读数/位置交接可能落在两次 SELECT 之间,使响应拼接不同数据库版本(错误
+    合并越界区间或归错保管位置)。这里用 `BEGIN`(deferred)开启只读事务,
+    自首次 SELECT 起固定 WAL 快照(不阻塞并发写入),四路数据取自同一版本;
+    异常时 ROLLBACK,保证事务一定结束。
+    """
+    conn.execute("BEGIN")
+    try:
+        profile = _get_profile(conn, sample_id)
+        if profile is None:
+            raise TemperatureError([_conflict(
+                "temp_profile_not_found",
+                f"样品 {sample_id} 尚未登记测温配置(允许温度上下限与最大采样间隔),"
+                "无法计算带保管位置的越界区间",
+                sample_id=sample_id,
+            )])
 
-    readings = conn.execute(
-        "SELECT measured_at_utc, temperature FROM temperature_readings"
-        " WHERE sample_id = ? ORDER BY measured_at_utc ASC, reading_id ASC",
-        (sample_id,),
-    ).fetchall()
-    events = _load_location_events(conn, sample_id)
-    intervals = compute_location_excursions(
-        readings,
-        events,
-        current_location=sample["location"],
-        min_temp=profile["min_temp"],
-        max_temp=profile["max_temp"],
-        max_interval_seconds=profile["max_interval_seconds"],
-    )
-    return s.LocationExcursionResponse(
-        sample_id=sample_id,
-        min_temp=profile["min_temp"],
-        max_temp=profile["max_temp"],
-        max_interval_seconds=profile["max_interval_seconds"],
-        intervals=intervals,
-    )
+        sample = conn.execute(
+            "SELECT location FROM samples WHERE sample_id = ?", (sample_id,)
+        ).fetchone()
+        if sample is None:
+            raise TemperatureError([_conflict(
+                "sample_not_found",
+                f"样品 {sample_id} 不存在",
+                sample_id=sample_id,
+            )])
+
+        readings = conn.execute(
+            "SELECT measured_at_utc, temperature FROM temperature_readings"
+            " WHERE sample_id = ? ORDER BY measured_at_utc ASC, reading_id ASC",
+            (sample_id,),
+        ).fetchall()
+        events = _load_location_events(conn, sample_id)
+        intervals = compute_location_excursions(
+            readings,
+            events,
+            current_location=sample["location"],
+            min_temp=profile["min_temp"],
+            max_temp=profile["max_temp"],
+            max_interval_seconds=profile["max_interval_seconds"],
+        )
+        result = s.LocationExcursionResponse(
+            sample_id=sample_id,
+            min_temp=profile["min_temp"],
+            max_temp=profile["max_temp"],
+            max_interval_seconds=profile["max_interval_seconds"],
+            intervals=intervals,
+        )
+        conn.execute("COMMIT")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
