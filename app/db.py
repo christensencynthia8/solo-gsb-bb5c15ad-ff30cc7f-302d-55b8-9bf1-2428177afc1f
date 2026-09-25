@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
@@ -539,6 +540,33 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+@contextmanager
+def read_only_snapshot(conn: sqlite3.Connection) -> Generator[None, None, None]:
+    """在单个只读事务内执行,使事务中的全部 SELECT 取自同一份 SQLite 快照。
+
+    WAL 模式下,deferred 事务(`BEGIN`)在首次读时建立读快照,事务期间
+    其他连接的提交一律不可见——避免一次查询内的多条 SELECT 拼到不同
+    数据库版本(混读越界区间/保管位置)。仅以 `COMMIT`/`ROLLBACK` 结束,
+    不写任何数据;`query_only` 再加一道只读保险,退出时恢复连接原设置。
+    异常时保证 `ROLLBACK`(即便 ROLLBACK 本身失败也恢复 query_only),
+    不留下未结束的事务占用连接。
+    """
+    was_query_only = conn.execute("PRAGMA query_only").fetchone()[0]
+    conn.execute("PRAGMA query_only = ON")
+    try:
+        conn.execute("BEGIN")
+        try:
+            yield
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            finally:
+                raise
+    finally:
+        conn.execute(f"PRAGMA query_only = {int(bool(was_query_only))}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:

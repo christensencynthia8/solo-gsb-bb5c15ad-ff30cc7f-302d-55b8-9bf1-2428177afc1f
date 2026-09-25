@@ -25,6 +25,10 @@
   位置(未登记为 null)。同一时刻的事件先交接后冲正,同类事件按明细编号
   (`item_id`)升序应用。连续同向越界读数除满足间隔条件外,还要求两读数之间
   (前一读数时刻, 本读数时刻] 没有位置变更事件(即同位置)才归为同一区间。
+  配置、样品位置、读数与交接/冲正事件在**同一个 SQLite 只读事务快照**中
+  读取,查询期间其他请求提交的新读数或位置交接对本次不可见,响应不会拼接
+  不同数据库版本;异常时回滚结束事务,下次查询重新取快照(乱序补录照常
+  实时重算)。
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from . import schemas as s
+from .db import read_only_snapshot
 
 
 class TemperatureError(Exception):
@@ -468,44 +473,51 @@ def _location_interval_from(current: dict) -> s.LocationExcursionInterval:
 def get_location_excursions(
     conn: sqlite3.Connection, sample_id: str
 ) -> s.LocationExcursionResponse:
-    """实时重算带保管位置的越界区间;样品或配置缺失由调用方/异常处理为 404。"""
-    profile = _get_profile(conn, sample_id)
-    if profile is None:
-        raise TemperatureError([_conflict(
-            "temp_profile_not_found",
-            f"样品 {sample_id} 尚未登记测温配置(允许温度上下限与最大采样间隔),"
-            "无法计算带保管位置的越界区间",
-            sample_id=sample_id,
-        )])
+    """实时重算带保管位置的越界区间;样品或配置缺失由调用方/异常处理为 404。
 
-    sample = conn.execute(
-        "SELECT location FROM samples WHERE sample_id = ?", (sample_id,)
-    ).fetchone()
-    if sample is None:
-        raise TemperatureError([_conflict(
-            "sample_not_found",
-            f"样品 {sample_id} 不存在",
-            sample_id=sample_id,
-        )])
+    测温配置、样品当前位置、全部读数与位置交接/冲正事件在**同一个只读
+    事务快照**内读取:查询期间其他请求写入的新读数或位置交接对本次不可见,
+    响应不会拼接不同数据库版本(错误合并越界区间或归错保管位置)。每次
+    请求重新开快照,故已提交的乱序补录在下次查询时照常参与实时重算。
+    """
+    with read_only_snapshot(conn):
+        profile = _get_profile(conn, sample_id)
+        if profile is None:
+            raise TemperatureError([_conflict(
+                "temp_profile_not_found",
+                f"样品 {sample_id} 尚未登记测温配置(允许温度上下限与最大采样间隔),"
+                "无法计算带保管位置的越界区间",
+                sample_id=sample_id,
+            )])
 
-    readings = conn.execute(
-        "SELECT measured_at_utc, temperature FROM temperature_readings"
-        " WHERE sample_id = ? ORDER BY measured_at_utc ASC, reading_id ASC",
-        (sample_id,),
-    ).fetchall()
-    events = _load_location_events(conn, sample_id)
-    intervals = compute_location_excursions(
-        readings,
-        events,
-        current_location=sample["location"],
-        min_temp=profile["min_temp"],
-        max_temp=profile["max_temp"],
-        max_interval_seconds=profile["max_interval_seconds"],
-    )
-    return s.LocationExcursionResponse(
-        sample_id=sample_id,
-        min_temp=profile["min_temp"],
-        max_temp=profile["max_temp"],
-        max_interval_seconds=profile["max_interval_seconds"],
-        intervals=intervals,
-    )
+        sample = conn.execute(
+            "SELECT location FROM samples WHERE sample_id = ?", (sample_id,)
+        ).fetchone()
+        if sample is None:
+            raise TemperatureError([_conflict(
+                "sample_not_found",
+                f"样品 {sample_id} 不存在",
+                sample_id=sample_id,
+            )])
+
+        readings = conn.execute(
+            "SELECT measured_at_utc, temperature FROM temperature_readings"
+            " WHERE sample_id = ? ORDER BY measured_at_utc ASC, reading_id ASC",
+            (sample_id,),
+        ).fetchall()
+        events = _load_location_events(conn, sample_id)
+        intervals = compute_location_excursions(
+            readings,
+            events,
+            current_location=sample["location"],
+            min_temp=profile["min_temp"],
+            max_temp=profile["max_temp"],
+            max_interval_seconds=profile["max_interval_seconds"],
+        )
+        return s.LocationExcursionResponse(
+            sample_id=sample_id,
+            min_temp=profile["min_temp"],
+            max_temp=profile["max_temp"],
+            max_interval_seconds=profile["max_interval_seconds"],
+            intervals=intervals,
+        )

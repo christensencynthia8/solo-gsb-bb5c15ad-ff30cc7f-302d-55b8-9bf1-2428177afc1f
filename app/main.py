@@ -892,7 +892,8 @@ def get_temperature_excursions(
     response_model=s.LocationExcursionResponse,
     tags=["冷链测温"],
     summary="带保管位置的越界区间查询:按位置交接/冲正审计 UTC 时间重建读数发生时"
-            "位置,相邻同向越界读数还须期间无位置变更(同位置)才归并",
+            "位置,相邻同向越界读数还须期间无位置变更(同位置)才归并;"
+            "配置/位置/读数/事件取自同一 SQLite 只读快照,避免并发混读",
 )
 def get_temperature_location_excursions(
     sample_id: str,

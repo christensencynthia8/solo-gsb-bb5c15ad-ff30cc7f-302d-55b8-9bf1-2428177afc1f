@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app import temperatures as tp
 from app.db import connect, init_db
 from app.main import app, get_conn
 
@@ -333,3 +334,131 @@ def test_out_of_order_backfill_recalculates_locations(client, conn):
         ("冷库A-1", "10:00:00"),
         ("冷库B-1", "10:05:00"),
     ]
+
+
+# ---------------------------------------------------------------- 并发快照
+
+def test_concurrent_writes_during_query_use_single_snapshot(
+    tmp_path, monkeypatch,
+):
+    """查询读到读数之后、读到位置事件/当前位置之前,另一连接提交新读数与
+    位置交接:整次响应必须取自同一只读快照(旧版本),不得拼接跨版本数据。
+
+    旧实现(无事务)会拿到:旧读数 + 新事件 + 新当前位置 -> 把一笔 above
+    读数按「首笔变更前原位置」归到 A-1 并与事件后语义错配;快照实现则只
+    看到提交前的状态(无事件,当前位置 B-1,一段 2 读数)。
+    """
+    db_path = str(tmp_path / "snap.db")
+    setup = connect(db_path)
+    init_db(setup)
+    setup.execute(
+        "INSERT INTO samples (sample_id, material, unit, initial_amount,"
+        " remaining, version, location, is_root) VALUES"
+        " ('S1', '血清', 'mL', 100, 100, 0, '冷库B-1', 1)"
+    )
+    setup.execute(
+        "INSERT INTO sample_temp_profiles (sample_id, min_temp, max_temp,"
+        " max_interval_seconds, payload) VALUES ('S1', 2.0, 8.0, 600, '{}')"
+    )
+    setup.executemany(
+        "INSERT INTO temperature_readings (sample_id, measured_at_utc,"
+        " temperature) VALUES ('S1', ?, ?)",
+        [("2026-09-24T10:00:00.000000Z", 9.0),
+         ("2026-09-24T10:05:00.000000Z", 9.5)],
+    )
+    setup.commit()
+    setup.close()
+
+    reader = connect(db_path)
+    writer = connect(db_path)
+
+    # 在「读数已读出、事件与当前位置尚未读取」的窗口由另一连接并发提交
+    def _concurrent_commit():
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "INSERT INTO location_transfers (transfer_no, operator, payload)"
+            " VALUES ('TRF-X', '交接员', '{}')"
+        )
+        writer.execute(
+            "INSERT INTO location_transfer_items (transfer_no, sample_id,"
+            " seq_index, from_location, to_location, operator, created_at)"
+            " VALUES ('TRF-X', 'S1', 0, '冷库A-1', '冷库B-1', '交接员', ?)",
+            ("2026-09-24T10:03:00.000000Z",),
+        )
+        writer.execute(
+            "INSERT INTO temperature_readings (sample_id, measured_at_utc,"
+            " temperature) VALUES ('S1', ?, 9.8)",
+            ("2026-09-24T10:07:00.000000Z",),
+        )
+        writer.execute(
+            "UPDATE samples SET location = '冷库C-1' WHERE sample_id = 'S1'"
+        )
+        writer.execute("COMMIT")
+
+    # reader 的快照在事务内首次读(profile)时建立;包装事件加载函数,
+    # 在其执行前(读数已读出后)先完成并发提交
+    original_load = tp._load_location_events
+
+    def patched_load(conn, sample_id):
+        _concurrent_commit()
+        return original_load(conn, sample_id)
+
+    monkeypatch.setattr(tp, "_load_location_events", patched_load)
+
+    try:
+        resp = tp.get_location_excursions(reader, "S1")
+    finally:
+        # 事务必须已结束(reader 不再处于事务中,可直接开启写事务)
+        reader.execute("BEGIN IMMEDIATE")
+        reader.execute("ROLLBACK")
+
+    # 快照视角:提交前无任何事件 -> 当前位置 冷库B-1;只有两笔读数 -> 一段
+    assert [(i.location, i.reading_count) for i in resp.intervals] == [
+        ("冷库B-1", 2),
+    ]
+
+    # 下一次查询重新取快照:已提交的补录全部可见,实时重算为两段
+    # (10:00 在交接前取 A-1;10:05、10:07 在交接后取 B-1,间隔 120s 延续)
+    resp2 = tp.get_location_excursions(reader, "S1")
+    assert [(i.location, i.start_at[11:19], i.end_at[11:19], i.reading_count)
+            for i in resp2.intervals] == [
+        ("冷库A-1", "10:00:00", "10:00:00", 1),
+        ("冷库B-1", "10:05:00", "10:07:00", 2),
+    ]
+
+    reader.close()
+    writer.close()
+
+
+def test_snapshot_rolled_back_on_error(tmp_path, monkeypatch):
+    """查询中途异常时只读事务必须回滚结束,连接恢复可写状态且 query_only 复位。"""
+    db_path = str(tmp_path / "rollback.db")
+    setup = connect(db_path)
+    init_db(setup)
+    setup.execute(
+        "INSERT INTO samples (sample_id, material, unit, initial_amount,"
+        " remaining, version, location, is_root) VALUES"
+        " ('S1', '血清', 'mL', 100, 100, 0, '冷库B-1', 1)"
+    )
+    setup.execute(
+        "INSERT INTO sample_temp_profiles (sample_id, min_temp, max_temp,"
+        " max_interval_seconds, payload) VALUES ('S1', 2.0, 8.0, 600, '{}')"
+    )
+    setup.commit()
+    setup.close()
+
+    conn = connect(db_path)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("snapshot boom")
+
+    monkeypatch.setattr(tp, "_load_location_events", boom)
+    with pytest.raises(RuntimeError, match="snapshot boom"):
+        tp.get_location_excursions(conn, "S1")
+
+    # 事务已结束:可立即开启 IMMEDIATE 写事务;query_only 已复位为 0
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("ROLLBACK")
+    assert conn.execute("PRAGMA query_only").fetchone()[0] == 0
+    conn.close()
+
